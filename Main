@@ -1,0 +1,86 @@
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import asyncio
+import re
+from playwright.async_api import async_playwright
+
+app = Flask(__name__)
+CORS(app)
+
+async def extraer_m3u8(url_episodio):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+
+        m3u8_url = None
+
+        def on_request(req):
+            nonlocal m3u8_url
+            if ".m3u8" in req.url and m3u8_url is None:
+                m3u8_url = req.url
+
+        page.on("request", on_request)
+
+        # Primero abrir la página del episodio en PelisPlus
+        await page.goto(url_episodio, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
+
+        # Buscar iframe de streamwish
+        iframes = await page.query_selector_all("iframe")
+        streamwish_src = None
+        for iframe in iframes:
+            src = await iframe.get_attribute("src")
+            if src and ("streamwish" in src or "swdyu" in src or "filelions" in src):
+                streamwish_src = src
+                break
+
+        # Si no encontró en iframes, buscar en el HTML
+        if not streamwish_src:
+            html = await page.content()
+            matches = re.findall(r'https?://[^\s"\'<>]*(?:streamwish|swdyu|filelions)[^\s"\'<>]*', html)
+            if matches:
+                streamwish_src = matches[0]
+
+        # Abrir StreamWish para capturar el .m3u8
+        if streamwish_src:
+            sw_page = await context.new_page()
+            sw_page.on("request", on_request)
+            try:
+                await sw_page.goto(streamwish_src, wait_until="domcontentloaded", timeout=20000)
+                await sw_page.wait_for_timeout(5000)
+            except:
+                pass
+            await sw_page.close()
+
+        await browser.close()
+        return m3u8_url
+
+@app.route("/m3u8")
+def get_m3u8():
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "Falta el parámetro url"}), 400
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        m3u8 = loop.run_until_complete(extraer_m3u8(url))
+        loop.close()
+        if m3u8:
+            return jsonify({"m3u8": m3u8})
+        else:
+            return jsonify({"error": "No se encontró el m3u8"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "mensaje": "API funcionando"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
